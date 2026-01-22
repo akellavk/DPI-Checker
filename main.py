@@ -1,4 +1,6 @@
-import asyncio
+import platform
+import re
+import subprocess
 import aiohttp
 import ipaddress
 import random
@@ -13,11 +15,90 @@ from asyncio import TimeoutError
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.DEBUG,  # Изменили на DEBUG чтобы видеть все логи
+    level=logging.DEBUG,
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+class PingChecker:
+    """Класс для PING проверки"""
+
+
+    @staticmethod
+    async def check_ping_async(ip: str, timeout: float = 5.0, count: int = 2) -> bool:
+        """Асинхронная проверка PING"""
+        try:
+            # Для асинхронного запуска subprocess используем asyncio.create_subprocess_exec
+            proc = await asyncio.create_subprocess_exec(
+                *PingChecker._get_ping_command(ip, count, timeout),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout + 1.0
+            )
+
+            return PingChecker._parse_ping_result(stdout.decode('utf-8', errors='ignore'),
+                                                  stderr.decode('utf-8', errors='ignore'))
+
+        except asyncio.TimeoutError:
+            return False
+        except Exception:
+            return False
+
+
+    @staticmethod
+    def _get_ping_command(ip: str, count: int, timeout: float) -> List[str]:
+        """Получение команды ping в зависимости от ОС"""
+        system = platform.system().lower()
+
+        if system == "windows":
+            return [
+                "ping", "-n", str(count), "-w", str(int(timeout * 1000)), ip
+            ]
+        elif system == "darwin":  # macOS
+            return [
+                "ping", "-c", str(count), "-t", str(int(timeout)), ip
+            ]
+        else:  # Linux и другие Unix-системы
+            return [
+                "ping", "-c", str(count), "-W", str(int(timeout)), ip
+            ]
+
+
+    @staticmethod
+    def _parse_ping_result(stdout: str, stderr: str) -> bool:
+        """Парсинг результата ping"""
+        if stderr:
+            return False
+
+        # Проверяем наличие успешных ответов в выводе
+        patterns = [
+            r"(\d+) packets? transmitted, (\d+) (?:packets? )?received",  # Linux/macOS
+            r"Packets: Sent = (\d+), Received = (\d+)",  # Windows
+            r"(\d+) packets? transmitted, (\d+) received",  # Альтернативный паттерн
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, stdout, re.IGNORECASE)
+            if match:
+                try:
+                    sent = int(match.group(1))
+                    received = int(match.group(2))
+                    if sent > 0 and received > 0:
+                        return True
+                except (ValueError, IndexError):
+                    continue
+
+        # Дополнительные проверки для Windows
+        if "Reply from" in stdout or "TTL=" in stdout:
+            return True
+
+        return False
 
 
 class PortChecker:
@@ -97,12 +178,13 @@ class IPv4WhitelistChecker:
 
         # Параметры по умолчанию
         self.timeout_ms = 5000
-        self.subnet_sample_size = 25
+        self.subnet_sample_size = 35
         self.subnet_alive_min = 3
         self.subnet_only_24_prefix = True
 
         # Настройки проверки портов
         self.check_methods = [
+            {"name": "PING", "func": self.check_ping_method, "enabled": True},
             {"name": "HTTPS", "func": self.check_https_method, "enabled": True},
             {"name": "HTTP", "func": self.check_http_method, "enabled": False},
             {"name": "SSH", "func": self.check_ssh_method, "enabled": True},
@@ -127,6 +209,8 @@ class IPv4WhitelistChecker:
 
         # Порты для проверки (можно настроить)
         self.port_checker = PortChecker()
+        # Ping для проверки
+        self.ping_checker = PingChecker()
 
     def set_params(self, timeout: int = None, sn_sample_size: int = None,
                    sn_alive_min: int = None, sn_only_24_prefix: bool = None,
@@ -188,6 +272,24 @@ class IPv4WhitelistChecker:
             result.append(str(ipaddress.IPv4Address(ip_int)))
 
         return result
+
+
+    async def check_ping_method(self, session: aiohttp.ClientSession, ip: str) -> bool:
+        """Проверка через PING (ICMP)"""
+        try:
+            # Используем количество пакетов = 2 для быстрой проверки
+            result = await self.ping_checker.check_ping_async(
+                ip,
+                timeout=self.timeout_ms / 1000,
+                count=2
+            )
+
+            self.log_push("DEBUG", f"PING[{ip}]", f"Result: {'Success' if result else 'Failed'}")
+            return result
+
+        except Exception as e:
+            self.log_push("DEBUG", f"PING[{ip}]", f"Error: {type(e).__name__}")
+            return False
 
     async def check_https_method(self, session: aiohttp.ClientSession, ip: str) -> bool:
         """Проверка через HTTPS HEAD запрос"""
