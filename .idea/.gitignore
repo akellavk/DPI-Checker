@@ -1,0 +1,10 @@
+# Файлы, игнорируемые по умолчанию
+/shelf/
+/workspace.xml
+# Игнорируемая папка по умолчанию с файлами запросов
+/queries/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+# Запросы HTTP-клиента в редакторе
+/httpRequests/
