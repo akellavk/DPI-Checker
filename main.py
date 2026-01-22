@@ -5,12 +5,88 @@ import random
 import json
 import csv
 from datetime import datetime
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Set, Optional, Union, Callable
 import logging
+import socket
+import asyncio
+from asyncio import TimeoutError
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
 logger = logging.getLogger(__name__)
+
+
+class PortChecker:
+    """Класс для проверки различных портов"""
+
+    @staticmethod
+    async def check_ssh(ip: str, timeout: float = 5.0) -> bool:
+        """Проверка SSH соединения по порту 22"""
+        try:
+            # Используем низкоуровневый asyncio для соединения с портом
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, 22),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (ConnectionRefusedError, TimeoutError, OSError, asyncio.TimeoutError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    async def check_http(ip: str, timeout: float = 5.0) -> bool:
+        """Проверка HTTP соединения по порту 80"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, 80),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (ConnectionRefusedError, TimeoutError, OSError, asyncio.TimeoutError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    async def check_https(ip: str, timeout: float = 5.0) -> bool:
+        """Проверка HTTPS соединения по порту 443"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, 443),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (ConnectionRefusedError, TimeoutError, OSError, asyncio.TimeoutError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    async def check_custom_port(ip: str, port: int, timeout: float = 5.0) -> bool:
+        """Проверка кастомного порта"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (ConnectionRefusedError, TimeoutError, OSError, asyncio.TimeoutError):
+            return False
+        except Exception:
+            return False
 
 
 class IPv4WhitelistChecker:
@@ -19,10 +95,22 @@ class IPv4WhitelistChecker:
             {"name": "Beget", "asns": ["198610"]},
         ]
 
+        # Параметры по умолчанию
         self.timeout_ms = 5000
         self.subnet_sample_size = 25
         self.subnet_alive_min = 3
         self.subnet_only_24_prefix = True
+
+        # Настройки проверки портов
+        self.check_methods = [
+            {"name": "HTTPS", "func": self.check_https_method, "enabled": True},
+            {"name": "HTTP", "func": self.check_http_method, "enabled": False},
+            {"name": "SSH", "func": self.check_ssh_method, "enabled": False},
+            {"name": "Custom Port", "func": self.check_custom_port_method, "enabled": False, "port": 8080},
+        ]
+
+        # Требуется ли хотя бы один метод для успеха
+        self.require_any_method = False
 
         self.cached_subnets = {}
         self.results_data = []
@@ -37,10 +125,13 @@ class IPv4WhitelistChecker:
 
         self.current_status = self.STATUS_READY_NON_CACHED
 
+        # Порты для проверки (можно настроить)
+        self.port_checker = PortChecker()
 
     def set_params(self, timeout: int = None, sn_sample_size: int = None,
-                   sn_alive_min: int = None, sn_only_24_prefix: bool = None):
-        """Установка параметров из URL (аналог getParamsHandler)"""
+                   sn_alive_min: int = None, sn_only_24_prefix: bool = None,
+                   check_methods: List[Dict] = None, require_any_method: bool = None):
+        """Установка параметров"""
         if timeout:
             self.timeout_ms = timeout
         if sn_sample_size:
@@ -49,7 +140,10 @@ class IPv4WhitelistChecker:
             self.subnet_alive_min = sn_alive_min
         if sn_only_24_prefix is not None:
             self.subnet_only_24_prefix = sn_only_24_prefix
-
+        if check_methods:
+            self.check_methods = check_methods
+        if require_any_method is not None:
+            self.require_any_method = require_any_method
 
     def log_push(self, level: str, prefix: str, msg: str):
         """Аналог logPush"""
@@ -93,10 +187,51 @@ class IPv4WhitelistChecker:
 
         return result
 
+    async def check_https_method(self, session: aiohttp.ClientSession, ip: str) -> bool:
+        """Проверка через HTTPS HEAD запрос"""
+        try:
+            url = f"https://{ip}/?t={random.random()}"
+            async with session.head(
+                url,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=self.timeout_ms / 1000),
+                allow_redirects=False
+            ) as response:
+                return True
+        except Exception:
+            return False
+
+    async def check_http_method(self, session: aiohttp.ClientSession, ip: str) -> bool:
+        """Проверка через HTTP HEAD запрос"""
+        try:
+            url = f"http://{ip}/?t={random.random()}"
+            async with session.head(
+                url,
+                timeout=aiohttp.ClientTimeout(total=self.timeout_ms / 1000),
+                allow_redirects=False
+            ) as response:
+                return True
+        except Exception:
+            return False
+
+    async def check_ssh_method(self, session: aiohttp.ClientSession, ip: str) -> bool:
+        """Проверка SSH порта 22"""
+        try:
+            return await self.port_checker.check_ssh(ip, self.timeout_ms / 1000)
+        except Exception:
+            return False
+
+    async def check_custom_port_method(self, session: aiohttp.ClientSession, ip: str) -> bool:
+        """Проверка кастомного порта"""
+        try:
+            port = next((m.get('port', 8080) for m in self.check_methods if m['name'] == 'Custom Port'), 8080)
+            return await self.port_checker.check_custom_port(ip, port, self.timeout_ms / 1000)
+        except Exception:
+            return False
 
     async def check_ipv4_host(self, session: aiohttp.ClientSession, ip: str,
                               early_abort_event: asyncio.Event, ref: Dict) -> bool:
-        """Проверка доступности хоста"""
+        """Проверка доступности хоста через все включенные методы"""
         if ref["alive_count"] >= self.subnet_alive_min:
             early_abort_event.set()
             return False
@@ -104,38 +239,68 @@ class IPv4WhitelistChecker:
         prefix = f"Host checker[{ip}]"
         self.log_push("INFO", prefix, "Started")
 
+        # Получаем включенные методы проверки
+        enabled_methods = [m for m in self.check_methods if m.get('enabled', False)]
+
+        if not enabled_methods:
+            self.log_push("WARN", prefix, "No check methods enabled!")
+            return False
+
+        results = []
+        method_tasks = []
+
+        # Запускаем проверки по всем методам параллельно
+        for method in enabled_methods:
+            task = method['func'](session, ip)
+            method_tasks.append(task)
+
         try:
-            # Добавляем случайный параметр для избежания кеширования
-            url = f"https://{ip}/?t={random.random()}"
+            method_results = await asyncio.gather(*method_tasks, return_exceptions=True)
 
-            async with session.head(
-                    url,
-                    ssl=False,  # Для тестирования, в production нужно настроить SSL
-                    timeout=aiohttp.ClientTimeout(total=self.timeout_ms / 1000),
-                    allow_redirects=False
-            ) as response:
-                # Любой ответ считается успехом
-                result = True
-        except asyncio.TimeoutError:
-            result = False
+            for i, result in enumerate(method_results):
+                method_name = enabled_methods[i]['name']
+                if isinstance(result, bool):
+                    results.append(result)
+                    status = "✅" if result else "❌"
+                    self.log_push("DEBUG", prefix, f"{method_name}: {status}")
+                else:
+                    results.append(False)
+                    self.log_push("DEBUG", prefix, f"{method_name}: Error {result}")
+
         except Exception as e:
-            # Другие ошибки (сеть, DNS и т.д.) считаем недоступностью
-            result = False
+            self.log_push("ERR", prefix, f"Check error: {e}")
+            results = [False] * len(enabled_methods)
 
-        if result:
+        # Определяем общий результат
+        if self.require_any_method:
+            # Хост считается доступным, если хотя бы один метод успешен
+            overall_result = any(results)
+        else:
+            # Хост считается доступным, если все включенные методы успешны
+            overall_result = all(results) if results else False
+
+        if overall_result:
             ref["alive_count"] += 1
 
         if ref["alive_count"] >= self.subnet_alive_min:
             early_abort_event.set()
 
-        status = "Alive ✅" if result else ("Early abort ⏭️" if early_abort_event.is_set() else "Dead 💀")
+        # Подробный лог результатов
+        success_count = sum(1 for r in results if r)
+        total_methods = len(results)
+
+        if overall_result:
+            status = f"Alive ✅ ({success_count}/{total_methods})"
+        elif early_abort_event.is_set():
+            status = "Early abort ⏭️"
+        else:
+            status = f"Dead 💀 ({success_count}/{total_methods})"
+
         self.log_push("INFO", prefix, f"{status}.")
-
-        return result
-
+        return overall_result
 
     async def check_subnet(self, session: aiohttp.ClientSession,
-                           provider: str, cidr: str) -> int:
+                           provider: str, cidr: str) -> Dict:
         """Проверка подсети на доступность"""
         prefix = f"Subnet checker[{provider} => {cidr}]"
         self.log_push("INFO", prefix, "Started")
@@ -155,7 +320,6 @@ class IPv4WhitelistChecker:
         # Ограничиваем количество одновременных запросов
         semaphore = asyncio.Semaphore(self.subnet_sample_size)
 
-
         async def limited_task(task):
             async with semaphore:
                 return await task
@@ -166,20 +330,23 @@ class IPv4WhitelistChecker:
 
         alive_count = sum(1 for r in results if r is True)
 
+        result_data = {
+            "provider": provider,
+            "cidr": cidr,
+            "alive_count": alive_count,
+            "total_checked": len([r for r in results if not isinstance(r, Exception)]),
+            "sample_size": len(ips)
+        }
+
         if alive_count > 0:
             self.results_count += 1
-            self.results_data.append({
-                "provider": provider,
-                "cidr": cidr,
-                "alive_count": alive_count
-            })
+            self.results_data.append(result_data)
 
             status = "✅" if alive_count >= self.subnet_alive_min else "⚠️"
-            self.log_push("INFO", prefix, f"Added to results: {cidr} {status}")
+            self.log_push("INFO", prefix, f"Added to results: {cidr} {status} (alive: {alive_count})")
 
-        self.log_push("INFO", prefix, f"Done (alive: {alive_count}).")
-        return alive_count
-
+        self.log_push("INFO", prefix, f"Done (alive: {alive_count}/{len(ips)}).")
+        return result_data
 
     async def fetch_as_ipv4_subnets(self, session: aiohttp.ClientSession, asn: str) -> List[str]:
         """Получение подсетей для AS номера"""
@@ -196,7 +363,7 @@ class IPv4WhitelistChecker:
                 prefixes = [
                     item["prefix"]
                     for item in data.get("data", {}).get("prefixes", [])
-                    if "." in item["prefix"] and "/" in item["prefix"]  # Только IPv4
+                    if "." in item["prefix"] and "/" in item["prefix"]
                 ]
 
                 self.log_push("INFO", prefix, f"Done (total: {len(prefixes)}).")
@@ -285,7 +452,7 @@ class IPv4WhitelistChecker:
         if not self.cached_subnets:
             self.log_push("ERR", prefix, "No cached subnets found. Cache first.")
             self.current_status = self.STATUS_READY_NON_CACHED
-            return
+            return False
 
         subnets_total = sum(len(subnets) for subnets in self.cached_subnets.values())
         subnets_checked = 0
@@ -334,12 +501,12 @@ class IPv4WhitelistChecker:
 
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['provider', 'cidr', 'alive_count']
+                fieldnames = ['provider', 'cidr', 'alive_count', 'total_checked', 'sample_size']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=';')
 
                 writer.writeheader()
                 for row in self.results_data:
-                    writer.writerow(row)
+                    writer.writerow({k: row.get(k, '') for k in fieldnames})
 
             self.log_push("INFO", "Results saver", f"Results saved to {filename}")
             return filename
@@ -351,30 +518,70 @@ class IPv4WhitelistChecker:
 
     def print_results_table(self):
         """Вывод результатов в виде таблицы"""
-        print("\n" + "=" * 60)
-        print(f"{'#':<3} {'Provider':<20} {'Whitelisted Subnet':<30}")
-        print("-" * 60)
+        if not self.results_data:
+            print("⚠️ No results to display")
+            return
+
+        print("\n" + "=" * 80)
+        print(f"{'#':<3} {'Provider':<15} {'Subnet':<20} {'Alive':<8} {'Total':<8} {'Status':<10}")
+        print("-" * 80)
 
         for i, result in enumerate(self.results_data, 1):
-            status = "✅" if result['alive_count'] >= self.subnet_alive_min else "⚠️"
-            subnet_display = f"{result['cidr']} {status}"
-            print(f"{i:<3} {result['provider']:<20} {subnet_display:<30}")
+            alive = result['alive_count']
+            total = result.get('total_checked', result.get('sample_size', 0))
+            ratio = alive / total if total > 0 else 0
 
-        print("=" * 60)
+            if alive >= self.subnet_alive_min:
+                status = "✅ WHITELISTED"
+            elif alive > 0:
+                status = "⚠️ PARTIAL"
+            else:
+                status = "❌ BLOCKED"
+
+            print(f"{i:<3} {result['provider']:<15} {result['cidr']:<20} "
+                  f"{alive:<8} {total:<8} {status:<10}")
+
+        print("=" * 80)
         print(f"Total: {self.results_count} subnets found")
 
+        # Статистика по методам проверки
+        enabled_methods = [m['name'] for m in self.check_methods if m.get('enabled', False)]
+        if enabled_methods:
+            print(f"Check methods: {', '.join(enabled_methods)}")
+            if self.require_any_method:
+                print("Mode: Host considered alive if ANY method succeeds")
+            else:
+                print("Mode: Host considered alive if ALL methods succeed")
 
     def get_status(self) -> str:
         """Получение текущего статуса"""
         return self.current_status
+
+    def print_methods_info(self):
+        """Вывод информации о методах проверки"""
+        print("\n" + "=" * 60)
+        print("Available check methods:")
+        print("-" * 60)
+
+        for i, method in enumerate(self.check_methods, 1):
+            enabled = "✓" if method.get('enabled', False) else "✗"
+            name = method['name']
+            if name == 'Custom Port':
+                port = method.get('port', 8080)
+                print(f"{i}. [{enabled}] {name} (port {port})")
+            else:
+                print(f"{i}. [{enabled}] {name}")
+
+        print("=" * 60)
 
 
 async def main():
     """Основная функция для тестирования"""
     checker = IPv4WhitelistChecker()
 
-    print("IPv4 Whitelisted Subnets Checker")
-    print("-" * 40)
+    print("=" * 60)
+    print("IPv4 Whitelisted Subnets Checker with Multi-Port Support")
+    print("=" * 60)
 
     # Пытаемся загрузить кэшированные данные
     has_cache = checker.load_cached_subnets()
@@ -387,9 +594,11 @@ async def main():
         print("3. Save results")
         print("4. Print results")
         print("5. Set parameters")
-        print("6. Exit")
+        print("6. Configure check methods")
+        print("7. Test single IP")
+        print("8. Exit")
 
-        choice = input("\nSelect option (1-6): ").strip()
+        choice = input("\nSelect option (1-8): ").strip()
 
         if choice == "1":
             print("\nCaching subnets...")
@@ -422,10 +631,7 @@ async def main():
                 print("⚠️ No results to save")
 
         elif choice == "4":
-            if checker.results_data:
-                checker.print_results_table()
-            else:
-                print("⚠️ No results to display")
+            checker.print_results_table()
 
         elif choice == "5":
             print("\nSet parameters:")
@@ -446,11 +652,72 @@ async def main():
                 if only_24:
                     checker.subnet_only_24_prefix = only_24 == "true"
 
+                mode = input(f"Require ANY method to succeed? (true/false) [{checker.require_any_method}]: ").strip().lower()
+                if mode:
+                    checker.require_any_method = mode == "true"
+
                 print("✓ Parameters updated")
             except ValueError:
                 print("✗ Invalid input")
 
         elif choice == "6":
+            print("\nConfigure check methods:")
+            checker.print_methods_info()
+
+            try:
+                method_choice = input("\nSelect method number to toggle (or 'all' to show all): ").strip()
+
+                if method_choice.lower() == 'all':
+                    for method in checker.check_methods:
+                        method['enabled'] = True
+                    print("✓ All methods enabled")
+                elif method_choice.isdigit():
+                    idx = int(method_choice) - 1
+                    if 0 <= idx < len(checker.check_methods):
+                        checker.check_methods[idx]['enabled'] = not checker.check_methods[idx].get('enabled', False)
+                        status = "enabled" if checker.check_methods[idx]['enabled'] else "disabled"
+                        print(f"✓ Method '{checker.check_methods[idx]['name']}' {status}")
+
+                        # Если это Custom Port, спросим порт
+                        if checker.check_methods[idx]['name'] == 'Custom Port' and checker.check_methods[idx]['enabled']:
+                            port = input(f"Enter port number [{checker.check_methods[idx].get('port', 8080)}]: ").strip()
+                            if port and port.isdigit():
+                                checker.check_methods[idx]['port'] = int(port)
+                    else:
+                        print("✗ Invalid method number")
+            except Exception as e:
+                print(f"✗ Error: {e}")
+
+        elif choice == "7":
+            print("\nTest single IP address:")
+            ip = input("Enter IP address: ").strip()
+
+            if not ip:
+                print("✗ No IP provided")
+                continue
+
+            try:
+                ipaddress.IPv4Address(ip)  # Валидация IP
+
+                print(f"\nTesting {ip}...")
+
+                # Тестируем все методы
+                async with aiohttp.ClientSession() as session:
+                    for method in checker.check_methods:
+                        if method.get('enabled', False):
+                            try:
+                                result = await method['func'](session, ip)
+                                status = "✓" if result else "✗"
+                                print(f"  {method['name']}: {status}")
+                            except Exception as e:
+                                print(f"  {method['name']}: Error ({e})")
+
+                print("\n✓ Test completed")
+
+            except ipaddress.AddressValueError:
+                print("✗ Invalid IP address")
+
+        elif choice == "8":
             print("Goodbye!")
             break
 
@@ -459,5 +726,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Для тестирования
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\nScript interrupted by user")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
