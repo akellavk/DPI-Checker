@@ -37,10 +37,9 @@ class IPv4WhitelistChecker:
 
         self.current_status = self.STATUS_READY_NON_CACHED
 
-
     def set_params(self, timeout: int = None, sn_sample_size: int = None,
                    sn_alive_min: int = None, sn_only_24_prefix: bool = None):
-        """Установка параметров из URL (аналог getParamsHandler)"""
+        """Установка параметров (аналог getParamsHandler)"""
         if timeout:
             self.timeout_ms = timeout
         if sn_sample_size:
@@ -50,8 +49,7 @@ class IPv4WhitelistChecker:
         if sn_only_24_prefix is not None:
             self.subnet_only_24_prefix = sn_only_24_prefix
 
-
-    def log_push(self, level: str, prefix: str, msg: str):
+    def log_push(self, level: str, prefix: Optional[str], msg: str) -> str:
         """Аналог logPush"""
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         prefix_str = f"{prefix}/" if prefix else ""
@@ -76,14 +74,12 @@ class IPv4WhitelistChecker:
             all_hosts = list(network.hosts())
             return [str(ip) for ip in all_hosts[:n]]
 
-        # Fisher-Yates shuffle для случайной выборки
         block_size = network.num_addresses - 2  # исключаем network и broadcast
         swap = {}
         result = []
 
         for i in range(min(n, block_size)):
             r = i + random.randint(0, block_size - i - 1)
-
             pick = swap.get(r, r)
             swap[r] = swap.get(i, i)
 
@@ -93,33 +89,56 @@ class IPv4WhitelistChecker:
 
         return result
 
-
-    async def check_ipv4_host(self, session: aiohttp.ClientSession, ip: str,
-                              early_abort_event: asyncio.Event, ref: Dict) -> bool:
-        """Проверка доступности хоста"""
-        if ref["alive_count"] >= self.subnet_alive_min:
-            early_abort_event.set()
+    async def check_ipv4_host(
+        self,
+        session: aiohttp.ClientSession,
+        ip: str,
+        early_abort_event: asyncio.Event,
+        ref: Dict,
+    ) -> bool:
+        """
+        Проверка одного хоста.
+        """
+        if early_abort_event.is_set():
+            self.log_push("INFO", f"Host checker[{ip}]", "Skipped (early abort ⏭️).")
             return False
 
         prefix = f"Host checker[{ip}]"
         self.log_push("INFO", prefix, "Started")
 
-        try:
-            # Добавляем случайный параметр для избежания кеширования
-            url = f"https://{ip}/?t={random.random()}"
+        url = f"https://{ip}/?t={random.random()}"
+        result = False
 
+        try:
             async with session.head(
-                    url,
-                    ssl=False,  # Для тестирования, в production нужно настроить SSL
-                    timeout=aiohttp.ClientTimeout(total=self.timeout_ms / 1000),
-                    allow_redirects=False
-            ) as response:
-                # Любой ответ считается успехом
+                url,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=self.timeout_ms / 1000),
+                allow_redirects=False,
+            ):
+                # Любой HTTP-ответ от сервера — хост жив
                 result = True
+
         except asyncio.TimeoutError:
+            # Хост не ответил за отведённое время — считаем мёртвым
             result = False
-        except Exception as e:
-            # Другие ошибки (сеть, DNS и т.д.) считаем недоступностью
+
+        # --- Явный список сетевых ошибок ---
+        except (
+            aiohttp.ClientConnectorError,  # не удалось установить соединение
+            aiohttp.ServerDisconnectedError,  # сервер разорвал соединение
+            aiohttp.ClientOSError,  # низкоуровневая ошибка сокета (Windows)
+        ) as e:
+            # --- Обрыв WiFi — ждём восстановления ---
+            self.log_push("INFO", prefix,
+                          f"Network error: {type(e).__name__}. Checking connectivity...")
+            await wait_for_connectivity(self.log_push)
+            # После восстановления соединения считаем хост недоступным —
+            # мы не знаем реального состояния, безопаснее пропустить.
+            result = False
+
+        except aiohttp.ClientError:
+            # Прочие ошибки клиента (неверный ответ, TLS и т.д.) — мёртвый
             result = False
 
         if result:
@@ -128,15 +147,33 @@ class IPv4WhitelistChecker:
         if ref["alive_count"] >= self.subnet_alive_min:
             early_abort_event.set()
 
-        status = "Alive ✅" if result else ("Early abort ⏭️" if early_abort_event.is_set() else "Dead 💀")
-        self.log_push("INFO", prefix, f"{status}.")
+        if result:
+            status = "Alive ✅"
+        elif early_abort_event.is_set():
+            status = "Early abort ⏭️"
+        else:
+            status = "Dead 💀"
 
+        self.log_push("INFO", prefix, f"{status}.")
         return result
 
-
-    async def check_subnet(self, session: aiohttp.ClientSession,
-                           provider: str, cidr: str) -> int:
-        """Проверка подсети на доступность"""
+    async def check_subnet(
+        self,
+        session: aiohttp.ClientSession,
+        provider: str,
+        cidr: str,
+    ) -> int:
+        """
+        Проверка подсети на доступность.
+        1. Semaphore = SUBNET_CONCURRENCY (5), а не subnet_sample_size (25).
+           Оригинал ограничивал параллельность; в старом коде semaphore был
+           равен числу задач и не давал никакого ограничения.
+        2. Проверка early_abort_event ВНУТРИ run_one, прямо перед захватом
+           семафора — задачи, созданные до установки флага, не будут
+           выполнять сетевой запрос.
+        3. Подсеть добавляется в результаты только при alive_count >= subnet_alive_min,
+           а не при alive_count > 0. Это исключает ложные срабатывания.
+        """
         prefix = f"Subnet checker[{provider} => {cidr}]"
         self.log_push("INFO", prefix, "Started")
 
@@ -144,42 +181,30 @@ class IPv4WhitelistChecker:
         early_abort_event = asyncio.Event()
         ref = {"alive_count": 0}
 
-        tasks = []
-        for ip in ips:
+        semaphore = asyncio.Semaphore(SUBNET_CONCURRENCY)
+
+        async def run_one(ip: str) -> bool:
             if early_abort_event.is_set():
-                break
-
-            task = self.check_ipv4_host(session, ip, early_abort_event, ref)
-            tasks.append(task)
-
-        # Ограничиваем количество одновременных запросов
-        semaphore = asyncio.Semaphore(self.subnet_sample_size)
-
-
-        async def limited_task(task):
+                return False
             async with semaphore:
-                return await task
+                return await self.check_ipv4_host(session, ip, early_abort_event, ref)
 
+        results = await asyncio.gather(*[run_one(ip) for ip in ips])
 
-        limited_tasks = [limited_task(task) for task in tasks]
-        results = await asyncio.gather(*limited_tasks, return_exceptions=True)
+        alive_count = ref["alive_count"]
 
-        alive_count = sum(1 for r in results if r is True)
-
-        if alive_count > 0:
+        if alive_count >= self.subnet_alive_min:
             self.results_count += 1
             self.results_data.append({
                 "provider": provider,
                 "cidr": cidr,
-                "alive_count": alive_count
+                "alive_count": alive_count,
             })
+            self.log_push("INFO", prefix, f"Whitelisted ✅ (alive: {alive_count}).")
+        else:
+            self.log_push("INFO", prefix, f"Done (alive: {alive_count} — below threshold).")
 
-            status = "✅" if alive_count >= self.subnet_alive_min else "⚠️"
-            self.log_push("INFO", prefix, f"Added to results: {cidr} {status}")
-
-        self.log_push("INFO", prefix, f"Done (alive: {alive_count}).")
         return alive_count
-
 
     async def fetch_as_ipv4_subnets(self, session: aiohttp.ClientSession, asn: str) -> List[str]:
         """Получение подсетей для AS номера"""
@@ -207,20 +232,18 @@ class IPv4WhitelistChecker:
             self.log_push("ERR", prefix, str(e))
             raise Exception(error_msg)
 
-
-    async def fetch_provider_ipv4_subnets(self, session: aiohttp.ClientSession,
-                                          provider: Dict) -> List[str]:
+    async def fetch_provider_ipv4_subnets(
+        self,
+        session: aiohttp.ClientSession,
+        provider: Dict,
+    ) -> List[str]:
         """Получение подсетей для провайдера"""
         prefix = f"Provider IPv4 subnets fetcher[{provider['name']}]"
         self.log_push("INFO", prefix, "Started")
 
-        tasks = []
-        for asn in provider["asns"]:
-            tasks.append(self.fetch_as_ipv4_subnets(session, asn))
-
+        tasks = [self.fetch_as_ipv4_subnets(session, asn) for asn in provider["asns"]]
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Объединяем результаты и удаляем дубликаты
         all_subnets = []
         for result in all_results:
             if isinstance(result, list):
@@ -230,17 +253,16 @@ class IPv4WhitelistChecker:
 
         merged = list(set(all_subnets))
 
-        # Фильтрация по префиксу /24 если нужно
         if self.subnet_only_24_prefix:
             suitable = [s for s in merged if s.endswith("/24")]
         else:
             suitable = merged
 
-        self.log_push("INFO", prefix,
-                      f"Done (all: {len(all_subnets)}, merged: {len(merged)}, suitable: {len(suitable)}).")
-
+        self.log_push(
+            "INFO", prefix,
+            f"Done (all: {len(all_subnets)}, merged: {len(merged)}, suitable: {len(suitable)}).",
+        )
         return suitable
-
 
     async def cache_subnets(self):
         """Кэширование подсетей"""
@@ -252,6 +274,9 @@ class IPv4WhitelistChecker:
         self.results_count = 0
 
         try:
+            # Перед кэшированием убеждаемся, что сеть есть
+            await wait_for_connectivity(self.log_push)
+
             async with aiohttp.ClientSession() as session:
                 for provider in self.test_suite:
                     subnets = await self.fetch_provider_ipv4_subnets(session, provider)
@@ -263,7 +288,6 @@ class IPv4WhitelistChecker:
 
             self.current_status = self.STATUS_READY_CACHED
             self.log_push("INFO", "Subnets cacher", "Cached successfully.")
-
             return True
 
         except Exception as e:
@@ -285,9 +309,12 @@ class IPv4WhitelistChecker:
         if not self.cached_subnets:
             self.log_push("ERR", prefix, "No cached subnets found. Cache first.")
             self.current_status = self.STATUS_READY_NON_CACHED
-            return
+            return False
 
-        subnets_total = sum(len(subnets) for subnets in self.cached_subnets.values())
+        # Перед началом проверки убеждаемся, что сеть есть
+        await wait_for_connectivity(self.log_push)
+
+        subnets_total = sum(len(s) for s in self.cached_subnets.values())
         subnets_checked = 0
 
         async with aiohttp.ClientSession() as session:
@@ -299,11 +326,11 @@ class IPv4WhitelistChecker:
                     await self.check_subnet(session, provider, subnet)
 
         self.current_status = self.STATUS_READY_CACHED
-        self.log_push("INFO", prefix,
-                      f"Done (found: {self.results_count}, total subnets: {subnets_total}).")
-
+        self.log_push(
+            "INFO", prefix,
+            f"Done (found: {self.results_count}, total subnets: {subnets_total}).",
+        )
         return self.results_count > 0
-
 
     def load_cached_subnets(self) -> bool:
         """Загрузка кэшированных подсетей из файла"""
@@ -311,10 +338,12 @@ class IPv4WhitelistChecker:
             with open("cached_subnets.json", "r") as f:
                 self.cached_subnets = json.load(f)
 
-            total = sum(len(subnets) for subnets in self.cached_subnets.values())
-            self.log_push("INFO", None,
-                          f"Cached subnets loaded (providers: {len(self.cached_subnets)}, total subnets: {total}).")
-
+            total = sum(len(s) for s in self.cached_subnets.values())
+            self.log_push(
+                "INFO", None,
+                f"Cached subnets loaded (providers: {len(self.cached_subnets)}, "
+                f"total subnets: {total}).",
+            )
             self.current_status = self.STATUS_READY_CACHED
             return True
 
@@ -325,18 +354,16 @@ class IPv4WhitelistChecker:
             self.log_push("ERR", None, f"Error loading cached subnets: {e}")
             return False
 
-
-    def save_results(self, filename: str = None):
+    def save_results(self, filename: str = None) -> Optional[str]:
         """Сохранение результатов в CSV файл"""
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"ipv4-whitelisted-subnets-{timestamp}.csv"
 
         try:
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['provider', 'cidr', 'alive_count']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=';')
-
+            with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+                fieldnames = ["provider", "cidr", "alive_count"]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=";")
                 writer.writeheader()
                 for row in self.results_data:
                     writer.writerow(row)
@@ -348,7 +375,6 @@ class IPv4WhitelistChecker:
             self.log_push("ERR", "Results saver", f"Error saving results: {e}")
             return None
 
-
     def print_results_table(self):
         """Вывод результатов в виде таблицы"""
         print("\n" + "=" * 60)
@@ -356,16 +382,13 @@ class IPv4WhitelistChecker:
         print("-" * 60)
 
         for i, result in enumerate(self.results_data, 1):
-            status = "✅" if result['alive_count'] >= self.subnet_alive_min else "⚠️"
-            subnet_display = f"{result['cidr']} {status}"
+            subnet_display = f"{result['cidr']} ✅"
             print(f"{i:<3} {result['provider']:<20} {subnet_display:<30}")
 
         print("=" * 60)
         print(f"Total: {self.results_count} subnets found")
 
-
     def get_status(self) -> str:
-        """Получение текущего статуса"""
         return self.current_status
 
 
@@ -376,8 +399,7 @@ async def main():
     print("IPv4 Whitelisted Subnets Checker")
     print("-" * 40)
 
-    # Пытаемся загрузить кэшированные данные
-    has_cache = checker.load_cached_subnets()
+    checker.load_cached_subnets()
 
     while True:
         print(f"\nCurrent status: {checker.get_status()}")
@@ -394,17 +416,13 @@ async def main():
         if choice == "1":
             print("\nCaching subnets...")
             success = await checker.cache_subnets()
-            if success:
-                print("✓ Subnets cached successfully")
-            else:
-                print("✗ Failed to cache subnets")
+            print("✓ Subnets cached successfully" if success else "✗ Failed to cache subnets")
 
         elif choice == "2":
-            print("\nChecking subnets...")
             if not checker.cached_subnets:
                 print("⚠️ No cached subnets found. Cache first.")
                 continue
-
+            print("\nChecking subnets...")
             has_results = await checker.check_subnets()
             if has_results:
                 print(f"✓ Found {checker.results_count} accessible subnets")
@@ -442,7 +460,9 @@ async def main():
                 if alive_min:
                     checker.subnet_alive_min = int(alive_min)
 
-                only_24 = input(f"Only /24 prefixes (true/false) [{checker.subnet_only_24_prefix}]: ").strip().lower()
+                only_24 = input(
+                    f"Only /24 prefixes (true/false) [{checker.subnet_only_24_prefix}]: "
+                ).strip().lower()
                 if only_24:
                     checker.subnet_only_24_prefix = only_24 == "true"
 
