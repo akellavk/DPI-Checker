@@ -4,13 +4,58 @@ import ipaddress
 import random
 import json
 import csv
+import socket
 from datetime import datetime
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Optional
 import logging
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+# Количество одновременных запросов внутри одной подсети
+SUBNET_CONCURRENCY = 5
+
+# Интервал между попытками переподключения (секунды)
+RECONNECT_CHECK_INTERVAL = 3
+
+# Хост для проверки наличия интернета (используем надёжный публичный DNS)
+CONNECTIVITY_CHECK_HOST = "8.8.8.8"
+CONNECTIVITY_CHECK_PORT = 53
+CONNECTIVITY_CHECK_TIMEOUT = 3
+
+
+async def wait_for_connectivity(log_fn) -> None:
+    """
+    Блокирует выполнение до тех пор, пока не восстановится интернет-соединение.
+    Проверяет TCP-соединение к публичному DNS (8.8.8.8:53) — это быстро и надёжно,
+    не зависит от HTTP-стека и работает даже при обрыве WiFi hotspot на Android.
+    """
+    first_check = True
+    while True:
+        try:
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: socket.create_connection(
+                        (CONNECTIVITY_CHECK_HOST, CONNECTIVITY_CHECK_PORT),
+                        timeout=CONNECTIVITY_CHECK_TIMEOUT
+                    ).close()
+                ),
+                timeout=CONNECTIVITY_CHECK_TIMEOUT + 1
+            )
+            # Соединение успешно — интернет есть
+            if not first_check:
+                log_fn("INFO", "Connectivity", "Connection restored ✅. Resuming...")
+            return
+        except Exception:
+            if first_check:
+                log_fn("INFO", "Connectivity",
+                       f"No internet. Waiting for connection "
+                       f"(retry every {RECONNECT_CHECK_INTERVAL}s)... ⏳")
+                first_check = False
+            await asyncio.sleep(RECONNECT_CHECK_INTERVAL)
 
 
 class IPv4WhitelistChecker:
